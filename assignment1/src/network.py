@@ -72,57 +72,42 @@ class ClassificationNetwork(torch.nn.Module):
             (1.0,  0.0, 0.8),   # 8: steer right + brake
         ]
 
-        # ===== TODO: (구현 영역) 아래 conv / fc를 개선하세요 =====
-        # 이 starter는 비교 기준으로 제공하는 작은 CNN입니다.
-        # 아래 두 블록을 개선하여 영상에서 주행에 필요한 특징을 학습해 보세요.
-        # 단순히 층을 늘린다고 성능이 좋아지는 것은 아닙니다. 주행 결과로 비교하세요.
-        #
-        # [전체 데이터 흐름]
-        # B는 한 번에 처리하는 영상 수(batch size)이며, 추론할 때는 보통 1입니다.
-        # 원본 입력 (B, 96, 96, 3)은 forward()에서 픽셀을 0~1로 정규화하고
-        # 채널 순서를 바꾸어 (B, 3, 96, 96)으로 만든 뒤 self.conv에 전달합니다.
-        # conv 출력 → 펼치기(flatten) → 센서 7개 결합 → self.fc → 행동 9개 점수
-        # 펼치기와 센서 결합은 아래 forward()에서 이미 처리합니다.
+        # ===== (구현 영역) conv / fc =====
+        # 입력 (B, 96, 96, 3)은 forward()에서 정규화한 뒤
+        # (B, 3, 96, 96)으로 변환합니다.
+        # 영상 특징 추출 → flatten → 센서 7개 결합 → 행동 9개 점수
         #
         # [1. 영상 특징 추출: self.conv]
-        # Conv2d(입력 채널, 출력 채널, kernel_size, stride)
-        # - 입력 채널 3: RGB 색상 채널 수입니다.
-        # - 출력 채널 8: 서로 다른 특징을 추출하는 필터 8개를 학습합니다.
-        # - kernel_size=5: 5×5 영역을 보고 특징을 계산합니다.
-        # - stride=4: 필터를 4픽셀 간격으로 이동하므로 공간 해상도가 줄어듭니다.
-        # 현재 padding=0, dilation=1이므로 출력 한 변은
-        # floor((96 - 5) / 4) + 1 = 23입니다. 즉 (B, 8, 23, 23)이 됩니다.
+        # 처음에는 stride=4로 연산량을 줄이고, 뒤의 3×3 합성곱으로
+        # 도로 경계와 곡선 등의 특징을 단계적으로 조합합니다.
+        # (B, 3, 96, 96) → (B, 16, 23, 23)
+        # → (B, 32, 12, 12) → (B, 64, 6, 6) → (B, 64, 4, 4)
         self.conv = torch.nn.Sequential(
-            torch.nn.Conv2d(3, 8, kernel_size=5, stride=4),
-            # 음수는 0으로 바꾸는 활성화 함수입니다. 텐서 크기는 유지합니다.
-            # 비선형 변환을 넣어 여러 층으로 더 복잡한 관계를 학습할 수 있게 합니다.
+            torch.nn.Conv2d(3, 16, kernel_size=5, stride=4),
             torch.nn.ReLU(),
-            # 각 채널의 공간 특징을 평균으로 요약하여 4×4로 만듭니다.
-            # 입력 공간 크기가 달라도 출력은 (B, 8, 4, 4)로 맞춥니다.
-            # 채널 수는 바꾸지 않으며, 너무 작게 요약하면 세부 정보를 잃을 수 있습니다.
+            torch.nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            torch.nn.ReLU(),
             MPSCompatibleAdaptiveAvgPool2d((4, 4)),
         )
         #
         # [2. 행동 분류: self.fc]
-        # forward()가 conv 출력을 펼치면 영상당 8×4×4 = 128개 특징이 됩니다.
-        # 여기에 영상 하단 계기판에서 추출한 센서 특징 7개를 붙입니다.
+        # 영상 특징 64×4×4 = 1024개와 센서 특징 7개를 결합합니다.
         # 센서 7개 = 속도 1개 + 바퀴별 ABS 4개 + 조향 1개 + 자이로 1개
-        # 따라서 첫 Linear의 입력 크기는 128 + 7 = 135입니다.
-        # 출력 (B, 9)의 각 값은 위 action_classes 순서에 해당하는 행동 점수(logit)입니다.
-        # 학습의 CrossEntropyLoss가 logits를 받으므로 마지막에 Softmax를 넣지 마세요.
-        # 추론에서는 가장 큰 점수의 행동을 선택합니다.
+        # 중간층은 영상과 센서의 관계를 학습하고, Dropout은 과적합을 줄입니다.
+        # 마지막 출력은 action_classes 순서의 (B, 9) logits입니다.
+        # CrossEntropyLoss에 전달하므로 마지막에 Softmax를 넣지 않습니다.
         self.fc = torch.nn.Sequential(
-            torch.nn.Linear(8 * 4 * 4 + 7, self.n_classes),
+            torch.nn.Linear(64 * 4 * 4 + 7, 128),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(p=0.2),
+            torch.nn.Linear(128, self.n_classes),
         )
         #
-        # [수정할 때 확인할 것]
-        # - Conv 층을 추가하면 앞 층의 출력 채널 = 다음 층의 입력 채널이어야 합니다.
-        # - 최종 conv 출력이 (B, C, H, W)라면 첫 Linear 입력은 C*H*W + 7입니다.
-        #   예: 최종 채널을 16으로 바꾸고 4×4 풀링을 유지하면 16*4*4 + 7입니다.
-        # - FC 중간층을 추가하면 앞 Linear의 출력 크기와 다음 입력 크기를 맞추세요.
-        # - 마지막 출력은 self.n_classes(9)를 유지하고 행동 클래스 순서는 바꾸지 마세요.
-        # - 층/채널이 많아지면 연산량과 메모리 사용도 늘어납니다.
-        # - train.start_model: auto를 유지하면 구조/연산 변경 시 처음부터 학습합니다.
+        # 구조가 변경되었으므로 새 가중치로 학습해야 합니다.
+        # train.start_model: auto는 호환성 검사 후 처음부터 학습합니다.
+        # 모델 성능은 학습 후 실제 주행 결과로 비교하세요.
         # ===== (구현 영역) 끝 =====
 
         self.to(device)
